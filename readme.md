@@ -1,101 +1,61 @@
-﻿ASAPCodeReview — Quick Start
+﻿# ASAPCodeReview — Local AI code review (Tabby + .NET)
 
-Purpose
-- Runs an automated code review for a Bitbucket Pull Request (PR).
-- Clones the PR source branch, computes a diff against the destination, asks a local Tabby LLM for a review, and posts a comment back to the PR.
+ASAPCodeReview is a tiny proof‑of‑concept that runs an AI‑assisted code review for a Bitbucket Pull Request using a locally hosted LLM via Tabby. No code leaves your machine.
 
-Prerequisites
-- .NET SDK 9.x (required to build/run this tool)
-- Git (required to clone repositories locally)
-- Tabby (local LLM server)
-  - Download from: https://github.com/TabbyML/tabby/releases
-  - GPU recommended; CPU also works but is slower.
+## What it does
+- Takes a Bitbucket PR URL (or workspace/repo/pr args)
+- Clones the source branch and computes a diff to the target
+- Sends the diff to a local model through Tabby
+- Posts the review back to the PR (or prints in dry‑run)
 
-Start Tabby
-1) Download and extract the Tabby release for your OS.
-2) From the Tabby folder, start the server (example on Windows with NVIDIA GPU):
-   .\tabby.exe serve --model StarCoder-1B --chat-model Qwen2-1.5B-Instruct --device cuda --port 8080
-   Notes:
-   - For CPU, replace --device cuda with --device cpu.
-   - Keep this running while you use ASAPCodeReview.
-3) Open the Tabby UI in your browser and create a user to obtain an API key:
-   http://127.0.0.1:8080/
+## Stack
+- .NET 9 console app
+- TabbyML as the local LLM server (e.g., Qwen2‑1.5B‑Instruct for chat, StarCoder‑1B for code)
+- Bitbucket REST API for PR metadata and comments
 
-Configure ASAPCodeReview
-You can configure via environment variables or appsettings.json (in the build output folder next to the executable). Environment variables override appsettings.json.
+## Quick start (Windows / PowerShell)
+1) Start Tabby (GPU example; CPU works with `--device cpu`):
+```
+.\tabby.exe serve --model StarCoder-1B --chat-model Qwen2-1.5B-Instruct --device cuda --port 8080
+```
+2) Create a user and copy the API key from: http://127.0.0.1:8080/
 
-Required settings
-- BITBUCKET_USERNAME: Your Bitbucket username (often your account name; sometimes email depending on your token setup)
-- BITBUCKET_API_TOKEN: Bitbucket App Password (token) with permissions to read PRs and write comments
-- TABBY_ENDPOINT: Tabby chat completions endpoint (default: http://localhost:8080/v1/chat/completions)
-- TABBY_API_KEY: API key you created in the Tabby UI
-
-Optional settings
-- BITBUCKET_WORKSPACE: Default workspace (used when not provided on the command line)
-- BITBUCKET_REPO_SLUG: Default repository slug (used when not provided on the command line)
-- TABBY_TIMEOUT_SECONDS: HTTP timeout in seconds for Tabby calls (default 600)
-- TOOL_TEMP_ROOT: Where to create temporary working folders (default is system temp)
-- TOOL_MAX_DIFF_CHARS: Truncate the diff to this many characters before sending to LLM (default 45000)
-- TOOL_DRY_RUN: true/false — if true, prints the review to console instead of posting to Bitbucket (default false)
-
-Optional appsettings.json template
-Place this file next to the built executable (e.g., ASAPCodeReview\bin\Debug\net9.0\appsettings.json). Environment variables still override these values.
+3) Configure app settings (preferred):
+- Open ASAPCodeReview\\appsettings.json.
+- Fill in your Bitbucket username and App Password, and your Tabby API key.
+- Example minimal config:
+```
 {
   "Bitbucket": {
-    "BaseUrl": "https://api.bitbucket.org/2.0",
-    "RepoBaseCloneUrl": "https://bitbucket.org",
-    "Workspace": "your-workspace",
-    "RepoSlug": "your-repo",
-    "Username": "your-username",
-    "ApiToken": "your-app-password"
+    "Username": "<your-username-or-email>",
+    "ApiToken": "<your-app-password>"
   },
   "Tabby": {
     "Endpoint": "http://localhost:8080/v1/chat/completions",
-    "ApiKey": "your-tabby-api-key",
-    "TimeoutSeconds": 600
-  },
-  "Tool": {
-    "TempRoot": null,
-    "MaxDiffChars": 45000,
-    "DryRun": false
+    "ApiKey": "<tabby-api-key>"
   }
 }
+```
+Note: Environment variables can still override these values if you prefer (BITBUCKET_USERNAME, BITBUCKET_API_TOKEN, TABBY_API_KEY, TABBY_ENDPOINT, etc.).
 
-How to Run
-Option A — Provide workspace/repo/pr explicitly:
-- Windows PowerShell
-  $env:BITBUCKET_USERNAME = "<your-username>"
-  $env:BITBUCKET_API_TOKEN = "<your-app-password>"
-  $env:TABBY_API_KEY = "<tabby-api-key>"
-  # TABBY_ENDPOINT defaults to http://localhost:8080/v1/chat/completions
+4) Run against a PR URL:
+```
+dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- "https://bitbucket.org/<workspace>/<repo>/pull-requests/<id>"
+```
 
-  dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- --workspace <workspace> --repo <repo-slug> --pr <id>
+Tips:
+- For dry-run, set `Tool.DryRun` to `true` in appsettings.json (or export `TOOL_DRY_RUN=true`).
+- Other optional settings (appsettings.json or env): `BITBUCKET_WORKSPACE`, `BITBUCKET_REPO_SLUG`, `TABBY_TIMEOUT_SECONDS`, `TOOL_TEMP_ROOT`, `TOOL_MAX_DIFF_CHARS`.
 
-Option B — Use a Bitbucket PR URL (parsing is built-in):
-  dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- "https://bitbucket.org/<workspace>/<repo>/pull-requests/<id>"
+## Notes & limitations
+- Works surprisingly well for readability, edge cases, and consistency nits.
+- Lacks deep project context/history; better docs/ADRs and commit messages improve results.
 
-You can also pass the URL with --prUrl:
-  dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- --prUrl "https://bitbucket.org/<workspace>/<repo>/pull-requests/<id>"
+## Roadmap
+- Feed repo docs/ADRs and PR history for more context
+- Try larger quantized models
+- Add GitHub/GitLab adapters
 
-Notes
-- Make sure Tabby is running and reachable at the endpoint you configured before running the tool.
-- If you set BITBUCKET_WORKSPACE and BITBUCKET_REPO_SLUG, you can omit --workspace/--repo and only pass --pr.
-- Use TOOL_DRY_RUN=true to preview the review text without posting a comment to the PR.
-- The tool clones the repository to a temporary directory (TOOL_TEMP_ROOT if provided, otherwise system temp), checks out the PR source branch, and computes a diff against the PR destination commit.
-
-Troubleshooting
-- Authentication
-  - Ensure BITBUCKET_USERNAME and BITBUCKET_API_TOKEN are set and valid (App Password with repository read and pull request write/comment permissions).
-- Tabby connection
-  - Confirm the server is up: visit http://127.0.0.1:8080/ and verify the API key in the UI. The code uses the chat completions endpoint: /v1/chat/completions.
-- Large diffs
-  - If reviews are cut off, increase TOOL_MAX_DIFF_CHARS (be aware of model/context limits).
-- Timeouts
-  - For slow models or large diffs, raise TABBY_TIMEOUT_SECONDS.
-
-Quick Example
-1) Start Tabby:
-   .\tabby.exe serve --model StarCoder-1B --chat-model Qwen2-1.5B-Instruct --device cuda --port 8080
-2) Create a user in the UI and copy the API key: http://127.0.0.1:8080/
-3) Run the tool with a PR URL:
-   dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- "https://bitbucket.org/acme/widgets/pull-requests/42"
+## Acknowledgments
+- Built with help from Junie Pro (Beta)
+- Thanks to TabbyML for the local LLM server
