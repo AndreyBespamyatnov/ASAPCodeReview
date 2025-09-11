@@ -38,24 +38,29 @@ internal class Program
 
             // 3) Ask Tabby for code review
             Console.WriteLine($"[AI] Asking Tabby for code review...");
-            var reviewText = await GetTabbyReviewAsync(cfg.Tabby, pr, diff);
+            var reviewText = await GetTabbyReviewAsync(cfg.Tabby, cfg.Tool, pr, diff);
+            var finalText = (reviewText ?? string.Empty).Trim();
 
-            // 5) Post comment to PR (unless DryRun)
-            if (cfg.Tool.DryRun)
+            if (IsNoIssuesSignal(finalText))
             {
-                Console.WriteLine("[DRY-RUN] Would post the following comment:\n" + reviewText);
+                Console.WriteLine("[INFO] Tabby reported no actionable issues. Skipping PR comment:");
+                Console.WriteLine("`" + finalText + "`");
+            }
+            else if (cfg.Tool.DryRun)
+            {
+                Console.WriteLine("[DRY-RUN] Would post the following comment:\n" + finalText);
             }
             else
             {
                 switch (cfg.Tool.PublishMode)
                 {
                     case PublishMode.StartReview:
-                        await StartPrReviewAsync(cfg.Bitbucket, input, reviewText);
+                        await StartPrReviewAsync(cfg.Bitbucket, input, finalText);
                         Console.WriteLine("[INFO] Review started (draft comment created). You can finalize it in Bitbucket.");
                         break;
                     case PublishMode.Publish:
                     default:
-                        await PostPrCommentAsync(cfg.Bitbucket, input, reviewText);
+                        await PostPrCommentAsync(cfg.Bitbucket, input, finalText);
                         Console.WriteLine("[INFO] Review comment posted.");
                         break;
                 }
@@ -94,6 +99,18 @@ internal class Program
         if (bool.TryParse(dryRun, out var d)) cfg.Tool.DryRun = d;
         var publishMode = GetEnvOrDefault("TOOL_PUBLISH_MODE", cfg.Tool.PublishMode.ToString());
         if (Enum.TryParse<PublishMode>(publishMode, true, out var pm)) cfg.Tool.PublishMode = pm;
+        var extraFolder = GetEnvOrDefault("TOOL_EXTRA_PROMPT_FOLDER", cfg.Tool.ExtraPromptFolder);
+        if (!string.IsNullOrWhiteSpace(extraFolder)) cfg.Tool.ExtraPromptFolder = extraFolder;
+        var extraRecursive = GetEnvOrDefault("TOOL_EXTRA_PROMPT_RECURSIVE", cfg.Tool.ExtraPromptRecursive.ToString());
+        if (bool.TryParse(extraRecursive, out var er)) cfg.Tool.ExtraPromptRecursive = er;
+        var maxExtraChars = GetEnvOrDefault("TOOL_MAX_EXTRA_PROMPT_CHARS", cfg.Tool.MaxExtraPromptChars.ToString());
+        if (int.TryParse(maxExtraChars, out var mec)) cfg.Tool.MaxExtraPromptChars = mec;
+        var maxExtraFileChars = GetEnvOrDefault("TOOL_MAX_EXTRA_PROMPT_FILE_CHARS", cfg.Tool.MaxExtraPromptFileChars.ToString());
+        if (int.TryParse(maxExtraFileChars, out var mefc)) cfg.Tool.MaxExtraPromptFileChars = mefc;
+        var systemFolder = GetEnvOrDefault("TOOL_SYSTEM_PROMPT_FOLDER", cfg.Tool.SystemPromptFolder);
+        if (!string.IsNullOrWhiteSpace(systemFolder)) cfg.Tool.SystemPromptFolder = systemFolder;
+        var systemRecursive = GetEnvOrDefault("TOOL_SYSTEM_PROMPT_RECURSIVE", cfg.Tool.SystemPromptRecursive.ToString());
+        if (bool.TryParse(systemRecursive, out var sr)) cfg.Tool.SystemPromptRecursive = sr;
 
         var input = InputArgs.Parse(args, cfg.Bitbucket.Workspace!, cfg.Bitbucket.RepoSlug!);
         return (cfg, input);
@@ -153,7 +170,7 @@ internal class Program
     {
         // Best-effort attempt to create a draft (unpublished) PR comment so it can be reviewed and published later in Bitbucket UI
         var url = $"{bb.BaseUrl}/repositories/{Uri.EscapeDataString(input.Workspace)}/{Uri.EscapeDataString(input.RepoSlug)}/pullrequests/{input.PrId}/comments";
-        var payload = new { content = new { raw = content }, is_draft = true };
+        var payload = new { content = new { raw = content }, pending = true };
         try
         {
             _ = await SendBitbucketAsync(bb, HttpMethod.Post, url, payload, "Bitbucket draft review request failed");
@@ -296,45 +313,38 @@ internal class Program
         var author = pr.author?.display_name?.ToString() ?? "(unknown)";
         var sb = new StringBuilder();
 
-        // Clear and explicit instructions for a Bitbucket-friendly Markdown review
-        sb.AppendLine("You are a senior software engineer performing a code review for a Bitbucket Pull Request.");
-        sb.AppendLine("Be concise, actionable, and respectful. Focus on correctness, security, performance, code style, tests, and maintainability.");
-        sb.AppendLine("Consider: 1. Code quality and adherence to best practices, 2. Potential bugs or edge cases, 3. Performance optimizations, 4. Readability and maintainability, 5. Any security concerns, Suggest improvements and explain your reasoning for each suggestion.");
+        // Compact instructions for a Bitbucket-friendly Markdown review
+        sb.AppendLine("You are a senior software engineer reviewing a Bitbucket Pull Request.");
+        sb.AppendLine("Goal: provide concise, actionable feedback focused on correctness, security, performance, tests, readability, and maintainability.");
         sb.AppendLine();
-        sb.AppendLine("Always include concrete suggestions and code snippets where appropriate.");
-        sb.AppendLine();
-        sb.AppendLine("Review the end comment, make sure it is no duplicates");
+        sb.AppendLine("Output rules (very important):");
+        sb.AppendLine("- Use compact Bitbucket Markdown language: short bullet points, avoid large headings, use bold labels, use code fences only when needed.");
+        sb.AppendLine("- Prefer small code snippets with language fences (```csharp, ```diff, ```json) when suggesting changes.");
+        sb.AppendLine("- Keep the review under ~600 words. No greetings or repetition.");
         sb.AppendLine();
 
-        // Context
-        sb.AppendLine("## Pull Request Context");
+        // Context (compact)
+        sb.AppendLine("PR context:");
         sb.AppendLine($"- Title: {title}");
         sb.AppendLine($"- Author: {author}");
-        sb.AppendLine();
-        sb.AppendLine("### Description");
+        sb.AppendLine("- Description:");
         sb.AppendLine(description);
         sb.AppendLine();
 
         // Diff
-        sb.AppendLine("### Unified Diff (may be truncated)");
+        sb.AppendLine("Unified diff (may be truncated):");
         sb.AppendLine("```diff");
         sb.AppendLine(diff);
         sb.AppendLine("```");
         sb.AppendLine();
 
-        // Required output format (Bitbucket Markdown)
-        sb.AppendLine("### Formatting rules:");
-        sb.AppendLine("-Use Markdown supported by Bitbucket (headings, bullet lists, code fences).");
-        sb.AppendLine("-Use language-specific code fences for snippets (e.g., ```csharp, ```diff, ```json).");
-        sb.AppendLine("-Keep the whole review under ~800–1000 words.");
-        sb.AppendLine();
-
         return sb.ToString();
     }
 
-    private static async Task<string> GetTabbyReviewAsync(TabbyConfig tabby, dynamic pr, string diff)
+    private static async Task<string> GetTabbyReviewAsync(TabbyConfig tabby, ToolConfig tool, dynamic pr, string diff)
     {
         var prompt = BuildTabbyPrompt(pr, diff);
+        var extraUserContent = BuildExtraUserPromptFromFolder(tool);
 
         using var http = new HttpClient();
         // Increase timeout to avoid default 100s cancellation when Tabby is slow
@@ -345,16 +355,28 @@ internal class Program
             http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tabby.ApiKey);
         }
 
+        // Build messages with optional persona system content and extra user content
+        var extraSystemContent = BuildSystemPromptFromFolder(tool);
+        var systemContent = string.IsNullOrWhiteSpace(extraSystemContent)
+            ? "You are a code review assistant."
+            : "You are a code review assistant.\n\n" + extraSystemContent;
+
+        var messages = new List<object>
+        {
+            new { role = "system", content = systemContent },
+            new { role = "user", content = prompt }
+        };
+        if (!string.IsNullOrWhiteSpace(extraUserContent))
+        {
+            messages.Add(new { role = "user", content = extraUserContent! });
+        }
+
         var payload = new
         {
             model = "tabby",
-            messages = new object[]
-            {
-                new { role = "system", content = "You are a code review assistant." },
-                new { role = "user", content = prompt }
-            },
+            messages = messages.ToArray(),
             temperature = 0.2,
-            max_tokens = 800
+            max_tokens = 1000
         };
 
         using var resp = await http.PostAsJsonAsync(tabby.Endpoint, payload);
@@ -389,7 +411,7 @@ internal class Program
             return string.IsNullOrWhiteSpace(body) ? "(Tabby returned empty response)" : body;
         }
 
-        // Fallback
+        // Fallback to raw body so users can see what's wrong
         return string.IsNullOrWhiteSpace(body) ? "(Tabby returned empty response)" : body;
     }
 
@@ -447,11 +469,167 @@ internal class Program
         return sb.ToString();
     }
 
+    private static bool IsNoIssuesSignal(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return true;
+        var t = text.Trim();
+        // Strip common fence/formatting wrappers
+        t = t.Trim('`', '#', '*', '-', ' ', '\t', '\r', '\n');
+        var lower = t.ToLowerInvariant();
+        if (lower is "no_issues" or "no issues" or "ok" or "lgtm" or "looks good" or "approved" or "all good") return true;
+        if (lower.StartsWith("lgtm")) return true;
+        if (lower.StartsWith("ok")) return true;
+        if (lower.Contains("no issues found") || lower.Contains("nothing to comment") || lower.Contains("nothing to review")) return true;
+        return false;
+    }
+
     private static string Truncate(string input, int max)
     {
         if (string.IsNullOrEmpty(input)) return input;
         if (input.Length <= max) return input;
         return input[..max] + "\n... [diff truncated]";
+    }
+
+    // Generic aggregator used by both system and user extra prompts
+    private static string? BuildAggregatedFromFolder(string? folder, bool recursive, int maxTotalChars, int maxFileChars, string headerPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(folder)) return null;
+
+        var resolved = ResolveFolderPath(folder);
+        if (string.IsNullOrWhiteSpace(resolved) || !Directory.Exists(resolved))
+        {
+            return null;
+        }
+
+        var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(resolved, "*", searchOption)
+                              .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                              .ToArray();
+        }
+        catch
+        {
+            return null;
+        }
+
+        if (!files.Any()) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"{headerPrefix}{resolved}");
+        var skipExts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".exe", ".dll", ".pdb", ".zip", ".tar", ".gz", ".7z", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".mp3", ".mp4", ".avi"
+        };
+
+        foreach (var file in files)
+        {
+            try
+            {
+                var ext = Path.GetExtension(file);
+                if (skipExts.Contains(ext)) continue;
+
+                string content;
+                try
+                {
+                    content = File.ReadAllText(file);
+                }
+                catch
+                {
+                    continue; // skip unreadable files
+                }
+
+                if (string.IsNullOrWhiteSpace(content)) continue;
+
+                if (content.Length > maxFileChars)
+                {
+                    content = content[..maxFileChars] + "\n... [file truncated]";
+                }
+
+                var rel = GetRelativePathSafe(resolved, file);
+                sb.AppendLine($"--- file: {rel} ---");
+                var fence = ExtToFence(ext);
+                if (!string.IsNullOrEmpty(fence)) sb.AppendLine($"```{fence}");
+                sb.AppendLine(content);
+                if (!string.IsNullOrEmpty(fence)) sb.AppendLine("```");
+                sb.AppendLine();
+
+                if (sb.Length >= maxTotalChars)
+                {
+                    sb.AppendLine("... [additional context truncated]");
+                    break;
+                }
+            }
+            catch
+            {
+                // ignore single file issues
+            }
+        }
+
+        var result = sb.ToString();
+        if (string.IsNullOrWhiteSpace(result)) return null;
+        return result.Length > maxTotalChars
+            ? result[..maxTotalChars]
+            : result;
+    }
+
+    private static string? BuildExtraUserPromptFromFolder(ToolConfig tool)
+        => BuildAggregatedFromFolder(tool.ExtraPromptFolder, tool.ExtraPromptRecursive, tool.MaxExtraPromptChars, tool.MaxExtraPromptFileChars, "Additional context files from: ");
+
+    private static string? BuildSystemPromptFromFolder(ToolConfig tool)
+        => BuildAggregatedFromFolder(tool.SystemPromptFolder, tool.SystemPromptRecursive, tool.MaxExtraPromptChars, tool.MaxExtraPromptFileChars, "Persona system instructions from: ");
+
+    private static string? ResolveFolderPath(string folder)
+    {
+        try
+        {
+            if (Path.IsPathRooted(folder))
+                return folder;
+
+            var candidates = new[]
+            {
+                Path.Combine(Environment.CurrentDirectory, folder),
+                Path.Combine(AppContext.BaseDirectory, folder),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", folder))
+            };
+            foreach (var c in candidates)
+            {
+                if (Directory.Exists(c)) return c;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return null;
+    }
+
+    private static string GetRelativePathSafe(string baseDir, string file)
+    {
+        try
+        {
+            var rel = Path.GetRelativePath(baseDir, file);
+            if (!string.IsNullOrWhiteSpace(rel) && !rel.StartsWith("..")) return rel; // within
+        }
+        catch { }
+        return Path.GetFileName(file);
+    }
+
+    private static string ExtToFence(string? ext)
+    {
+        ext = (ext ?? string.Empty).TrimStart('.').ToLowerInvariant();
+        return ext switch
+        {
+            "cs" => "csharp",
+            "json" => "json",
+            "xml" => "xml",
+            "yml" => "yaml",
+            "yaml" => "yaml",
+            "md" => "markdown",
+            "txt" => string.Empty,
+            _ => string.Empty
+        };
     }
 }
 
@@ -508,6 +686,20 @@ public class ToolConfig
     public int MaxDiffChars { get; set; } = 45000;
     public bool DryRun { get; set; } = false;
     public PublishMode PublishMode { get; set; } = PublishMode.Publish;
+
+    // Additional prompt context configuration
+    // If set, the application will read text files from this folder and include them
+    // as an additional 'user' message in the Tabby request.
+    public string? ExtraPromptFolder { get; set; }
+    public bool ExtraPromptRecursive { get; set; } = false;
+    public int MaxExtraPromptChars { get; set; } = 20000;
+    public int MaxExtraPromptFileChars { get; set; } = 8000;
+
+    // System persona (system role) configuration
+    // If set, the application will read text files from this folder and include them
+    // in the 'system' message sent to the LLM.
+    public string? SystemPromptFolder { get; set; } = "persona";
+    public bool SystemPromptRecursive { get; set; } = false;
 }
 
 public record InputArgs(string Workspace, string RepoSlug, int PrId)
