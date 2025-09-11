@@ -32,9 +32,8 @@ internal class Program
             await CloneAndCheckoutAsync(cloneUrl, repoDir, cfg.Bitbucket, srcCommit, branchName);
             Console.WriteLine($"[INFO] Repo ready at {repoDir}");
 
-            var diff = ComputeLocalDiff(repoDir, dstCommit, srcCommit);
+            var diff = ComputeLocalDiff(repoDir, dstCommit, srcCommit, cfg.Tool);
             // Ensure the diff isn't too large for the LLM or Bitbucket comment limits
-            diff = Truncate(diff, cfg.Tool.MaxDiffChars);
 
             // 3) Ask Tabby for code review
             Console.WriteLine($"[AI] Asking Tabby for code review...");
@@ -111,6 +110,13 @@ internal class Program
         if (!string.IsNullOrWhiteSpace(systemFolder)) cfg.Tool.SystemPromptFolder = systemFolder;
         var systemRecursive = GetEnvOrDefault("TOOL_SYSTEM_PROMPT_RECURSIVE", cfg.Tool.SystemPromptRecursive.ToString());
         if (bool.TryParse(systemRecursive, out var sr)) cfg.Tool.SystemPromptRecursive = sr;
+        // Comma/semicolon separated patterns, e.g.: "*.resx,docs/**".
+        var ignoreGlobsEnv = GetEnvOrDefault("TOOL_IGNORE_DIFF_GLOBS", string.Join(",", cfg.Tool.IgnoreDiffGlobs ?? Array.Empty<string>()));
+        if (!string.IsNullOrWhiteSpace(ignoreGlobsEnv))
+        {
+            cfg.Tool.IgnoreDiffGlobs = ignoreGlobsEnv
+                .Split(new[] { ',', ';', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        }
 
         var input = InputArgs.Parse(args, cfg.Bitbucket.Workspace!, cfg.Bitbucket.RepoSlug!);
         return (cfg, input);
@@ -147,7 +153,7 @@ internal class Program
         if (!resp.IsSuccessStatusCode)
         {
             var ctx = string.IsNullOrWhiteSpace(errorContext) ? "Bitbucket request failed" : errorContext!;
-            throw new HttpRequestException($"{ctx}. Status: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Truncate(body, 2000)}");
+            throw new HttpRequestException($"{ctx}. Status: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {body}");
         }
         return body;
     }
@@ -293,7 +299,7 @@ internal class Program
         }
     }
 
-    private static string ComputeLocalDiff(string repoDir, string? baseCommitSha, string? headCommitSha)
+    private static string ComputeLocalDiff(string repoDir, string? baseCommitSha, string? headCommitSha, ToolConfig tool)
     {
         if (string.IsNullOrWhiteSpace(baseCommitSha) || string.IsNullOrWhiteSpace(headCommitSha))
             throw new ArgumentException("Missing base or head commit SHA for local diff computation.");
@@ -303,7 +309,53 @@ internal class Program
         var headCommit = repo.Lookup<Commit>(headCommitSha) ?? throw new InvalidOperationException($"Head commit not found locally: {headCommitSha}");
 
         var patch = repo.Diff.Compare<Patch>(baseCommit.Tree, headCommit.Tree);
-        return patch.Content;
+
+        // Apply ignore filters from configuration (e.g., *.resx)
+        var ignore = tool.IgnoreDiffGlobs ?? Array.Empty<string>();
+        if (ignore.Length == 0)
+        {
+            return patch.Content;
+        }
+
+        var patterns = ignore.Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
+        if (patterns.Length == 0)
+        {
+            return patch.Content;
+        }
+
+        int skipped = 0, included = 0;
+        var sb = new StringBuilder();
+        foreach (var entry in patch)
+        {
+            var path = entry.Path ?? string.Empty;
+            var oldPath = entry.OldPath ?? string.Empty;
+            if (MatchesAnyGlob(path, patterns) || (!string.IsNullOrEmpty(oldPath) && MatchesAnyGlob(oldPath, patterns)))
+            {
+                skipped++;
+                continue;
+            }
+            sb.Append(entry.Patch);
+            if (!entry.Patch.EndsWith("\n")) sb.AppendLine();
+            included++;
+        }
+
+        var content = sb.ToString();
+        Console.WriteLine($"[INFO] Diff files included: {included}, skipped by patterns: {skipped}.");
+        if (string.IsNullOrWhiteSpace(content))
+            return "(diff suppressed by ignore patterns)";
+        return content;
+    }
+
+    private static bool MatchesAnyGlob(string? path, IEnumerable<string> globs)
+    {
+        path = (path ?? string.Empty).Replace('\\', '/');
+        foreach (var g in globs)
+        {
+            var pat = (g ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(pat)) continue;
+            if (path.Contains(pat, StringComparison.InvariantCultureIgnoreCase)) return true;
+        }
+        return false;
     }
 
     private static string BuildTabbyPrompt(dynamic pr, string diff)
@@ -312,16 +364,6 @@ internal class Program
         var description = pr.description?.ToString() ?? "(no description)";
         var author = pr.author?.display_name?.ToString() ?? "(unknown)";
         var sb = new StringBuilder();
-
-        // Compact instructions for a Bitbucket-friendly Markdown review
-        sb.AppendLine("You are a senior software engineer reviewing a Bitbucket Pull Request.");
-        sb.AppendLine("Goal: provide concise, actionable feedback focused on correctness, security, performance, tests, readability, and maintainability.");
-        sb.AppendLine();
-        sb.AppendLine("Output rules (very important):");
-        sb.AppendLine("- Use compact Bitbucket Markdown language: short bullet points, avoid large headings, use bold labels, use code fences only when needed.");
-        sb.AppendLine("- Prefer small code snippets with language fences (```csharp, ```diff, ```json) when suggesting changes.");
-        sb.AppendLine("- Keep the review under ~600 words. No greetings or repetition.");
-        sb.AppendLine();
 
         // Context (compact)
         sb.AppendLine("PR context:");
@@ -338,6 +380,12 @@ internal class Program
         sb.AppendLine("```");
         sb.AppendLine();
 
+        sb.AppendLine("Output rules (very important):");
+        sb.AppendLine("- Use compact Bitbucket Markdown language: short bullet points, avoid large headings, use bold labels, use code fences only when needed.");
+        sb.AppendLine("- Prefer small code snippets with language fences (```csharp, ```diff, ```json) when suggesting changes.");
+        sb.AppendLine("- Keep the review under ~600 words. No greetings or repetition.");
+        sb.AppendLine();
+        
         return sb.ToString();
     }
 
@@ -364,13 +412,15 @@ internal class Program
         var messages = new List<object>
         {
             new { role = "system", content = systemContent },
-            new { role = "user", content = prompt }
         };
+        
         if (!string.IsNullOrWhiteSpace(extraUserContent))
         {
-            messages.Add(new { role = "user", content = extraUserContent! });
+            messages.Add(new { role = "user", content = extraUserContent });
         }
-
+            
+        messages.Add(new { role = "user", content = prompt });
+        
         var payload = new
         {
             model = "tabby",
@@ -397,7 +447,7 @@ internal class Program
                 }
             }
             catch { /* fall back to raw body */ }
-            throw new HttpRequestException($"Tabby request failed: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Truncate(body, 2000)}");
+            throw new HttpRequestException($"Tabby request failed: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {body}");
         }
 
         // First, handle Server-Sent Events (text/event-stream) by assembling chunks
@@ -481,13 +531,6 @@ internal class Program
         if (lower.StartsWith("ok")) return true;
         if (lower.Contains("no issues found") || lower.Contains("nothing to comment") || lower.Contains("nothing to review")) return true;
         return false;
-    }
-
-    private static string Truncate(string input, int max)
-    {
-        if (string.IsNullOrEmpty(input)) return input;
-        if (input.Length <= max) return input;
-        return input[..max] + "\n... [diff truncated]";
     }
 
     // Generic aggregator used by both system and user extra prompts
@@ -700,6 +743,9 @@ public class ToolConfig
     // in the 'system' message sent to the LLM.
     public string? SystemPromptFolder { get; set; } = "persona";
     public bool SystemPromptRecursive { get; set; } = false;
+
+    // Files to ignore when building diffs (glob patterns, e.g., "*.resx", "docs/**")
+    public string[] IgnoreDiffGlobs { get; set; } = [];
 }
 
 public record InputArgs(string Workspace, string RepoSlug, int PrId)
