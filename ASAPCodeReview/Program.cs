@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Diagnostics;
 using LibGit2Sharp;
+using Microsoft.Extensions.Configuration;
 
 internal class Program
 {
@@ -46,8 +47,18 @@ internal class Program
             }
             else
             {
-                await PostPrCommentAsync(cfg.Bitbucket, input, reviewText);
-                Console.WriteLine("[INFO] Review comment posted.");
+                switch (cfg.Tool.PublishMode)
+                {
+                    case PublishMode.StartReview:
+                        await StartPrReviewAsync(cfg.Bitbucket, input, reviewText);
+                        Console.WriteLine("[INFO] Review started (draft comment created). You can finalize it in Bitbucket.");
+                        break;
+                    case PublishMode.Publish:
+                    default:
+                        await PostPrCommentAsync(cfg.Bitbucket, input, reviewText);
+                        Console.WriteLine("[INFO] Review comment posted.");
+                        break;
+                }
             }
 
             Console.WriteLine("[SUCCESS] Done.");
@@ -55,8 +66,8 @@ internal class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine("[ERROR] " + ex.Message);
-            Console.Error.WriteLine(ex.ToString());
+            await Console.Error.WriteLineAsync("[ERROR] " + ex.Message);
+            await Console.Error.WriteLineAsync(ex.ToString());
             return 1;
         }
     }
@@ -81,6 +92,8 @@ internal class Program
         if (int.TryParse(maxDiffChars, out var m)) cfg.Tool.MaxDiffChars = m;
         var dryRun = GetEnvOrDefault("TOOL_DRY_RUN", cfg.Tool.DryRun.ToString());
         if (bool.TryParse(dryRun, out var d)) cfg.Tool.DryRun = d;
+        var publishMode = GetEnvOrDefault("TOOL_PUBLISH_MODE", cfg.Tool.PublishMode.ToString());
+        if (Enum.TryParse<PublishMode>(publishMode, true, out var pm)) cfg.Tool.PublishMode = pm;
 
         var input = InputArgs.Parse(args, cfg.Bitbucket.Workspace!, cfg.Bitbucket.RepoSlug!);
         return (cfg, input);
@@ -102,15 +115,30 @@ internal class Program
         return http;
     }
 
-    private static async Task<dynamic> GetPullRequestAsync(BitbucketConfig bb, InputArgs input)
+    private static async Task<string> SendBitbucketAsync(BitbucketConfig bb, HttpMethod method, string url, object? payload = null, string? errorContext = null)
     {
-        var url = $"{bb.BaseUrl}/repositories/{Uri.EscapeDataString(input.Workspace)}/{Uri.EscapeDataString(input.RepoSlug)}/pullrequests/{input.PrId}";
         using var http = CreateBitbucketHttp(bb);
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        using var req = new HttpRequestMessage(method, url);
+        if (payload != null)
+        {
+            var json = JsonSerializer.Serialize(payload);
+            req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+        }
+
         var resp = await http.SendAsync(req);
         var body = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode)
-            throw new HttpRequestException($"Bitbucket request failed. Status: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Truncate(body, 2000)}");
+        {
+            var ctx = string.IsNullOrWhiteSpace(errorContext) ? "Bitbucket request failed" : errorContext!;
+            throw new HttpRequestException($"{ctx}. Status: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Truncate(body, 2000)}");
+        }
+        return body;
+    }
+
+    private static async Task<dynamic> GetPullRequestAsync(BitbucketConfig bb, InputArgs input)
+    {
+        var url = $"{bb.BaseUrl}/repositories/{Uri.EscapeDataString(input.Workspace)}/{Uri.EscapeDataString(input.RepoSlug)}/pullrequests/{input.PrId}";
+        var body = await SendBitbucketAsync(bb, HttpMethod.Get, url, null, "Bitbucket PR fetch failed");
         return JsonSerializer.Deserialize<JsonElement>(body).ToDynamic();
     }
 
@@ -118,28 +146,29 @@ internal class Program
     {
         var url = $"{bb.BaseUrl}/repositories/{Uri.EscapeDataString(input.Workspace)}/{Uri.EscapeDataString(input.RepoSlug)}/pullrequests/{input.PrId}/comments";
         var payload = new { content = new { raw = content } };
-        var json = JsonSerializer.Serialize(payload);
-        using var http = CreateBitbucketHttp(bb);
-        using var req = new HttpRequestMessage(HttpMethod.Post, url);
-        req.Content = new StringContent(json, Encoding.UTF8, "application/json");
-        var resp = await http.SendAsync(req);
-        var body = await resp.Content.ReadAsStringAsync();
-        if (!resp.IsSuccessStatusCode)
-            throw new HttpRequestException($"Bitbucket request failed. Status: {(int)resp.StatusCode} {resp.ReasonPhrase}. Body: {Truncate(body, 2000)}");
+        _ = await SendBitbucketAsync(bb, HttpMethod.Post, url, payload, "Bitbucket comment post failed");
+    }
+
+    private static async Task StartPrReviewAsync(BitbucketConfig bb, InputArgs input, string content)
+    {
+        // Best-effort attempt to create a draft (unpublished) PR comment so it can be reviewed and published later in Bitbucket UI
+        var url = $"{bb.BaseUrl}/repositories/{Uri.EscapeDataString(input.Workspace)}/{Uri.EscapeDataString(input.RepoSlug)}/pullrequests/{input.PrId}/comments";
+        var payload = new { content = new { raw = content }, is_draft = true };
+        try
+        {
+            _ = await SendBitbucketAsync(bb, HttpMethod.Post, url, payload, "Bitbucket draft review request failed");
+        }
+        catch (HttpRequestException ex)
+        {
+            // Add helpful tip while preserving the underlying HTTP details
+            throw new HttpRequestException(ex.Message + ". Tip: Set Tool.PublishMode=Publish to post the comment immediately if drafts are not supported in your Bitbucket plan.", ex);
+        }
     }
 
     private static string PrepareTempDir(string? tempRoot)
     {
-        string root;
-        if (string.IsNullOrWhiteSpace(tempRoot))
-        {
-            // Store temp files under the execution app directory by default
-            root = Path.Combine(AppContext.BaseDirectory, "temp");
-        }
-        else
-        {
-            root = tempRoot;
-        }
+        // Store temp files under the execution app directory by default
+        var root = string.IsNullOrWhiteSpace(tempRoot) ? Path.Combine(AppContext.BaseDirectory, "temp") : tempRoot;
         if (!Directory.Exists(root)) Directory.CreateDirectory(root);
         return root;
     }
@@ -150,7 +179,7 @@ internal class Program
         // If an email is provided, use the part before '@' as the git username.
         if (string.IsNullOrWhiteSpace(username)) return username;
         var at = username.IndexOf('@');
-        return at > 0 ? username.Substring(0, at) : username;
+        return at > 0 ? username[..at] : username;
     }
 
     private static async Task CloneAndCheckoutAsync(string cloneUrl, string repoDir, BitbucketConfig bb, string? commitSha, string? branchName)
@@ -161,7 +190,7 @@ internal class Program
             throw new InvalidOperationException("BITBUCKET_USERNAME is required for git operations with API token.");
 
         var gitUsername = ExtractGitUsername(bb.Username!);
-        string authUrl = InjectCredentialsIntoHttpsUrlRaw(cloneUrl, gitUsername, bb.ApiToken!);
+        var authUrl = InjectCredentialsIntoHttpsUrlRaw(cloneUrl, gitUsername, bb.ApiToken!);
 
         var gitDir = Path.Combine(repoDir, ".git");
         if (!Directory.Exists(gitDir))
@@ -238,8 +267,8 @@ internal class Program
         };
         if (!string.IsNullOrWhiteSpace(workingDir)) psi.WorkingDirectory = workingDir;
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start git process.");
-        string stdout = proc.StandardOutput.ReadToEnd();
-        string stderr = proc.StandardError.ReadToEnd();
+        var stdout = proc.StandardOutput.ReadToEnd();
+        var stderr = proc.StandardError.ReadToEnd();
         proc.WaitForExit();
         if (proc.ExitCode != 0)
         {
@@ -422,7 +451,7 @@ internal class Program
     {
         if (string.IsNullOrEmpty(input)) return input;
         if (input.Length <= max) return input;
-        return input.Substring(0, max) + "\n... [diff truncated]";
+        return input[..max] + "\n... [diff truncated]";
     }
 }
 
@@ -436,21 +465,17 @@ public class AppConfig
 
     public static AppConfig Load()
     {
-        try
-        {
-            var path = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-            if (File.Exists(path))
-            {
-                var json = File.ReadAllText(path);
-                var cfg = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-                return cfg ?? new AppConfig();
-            }
-        }
-        catch { /* ignore and use defaults */ }
-        return new AppConfig();
+        // Build configuration from appsettings.json in the app base directory (optional, reloadable)
+        var configuration = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: true)
+            .Build();
+
+        // Start with defaults and bind any matching values from configuration
+        var cfg = new AppConfig();
+        configuration.Bind(cfg);
+        return cfg;
     }
 }
 
@@ -471,11 +496,18 @@ public class TabbyConfig
     public int TimeoutSeconds { get; set; } = 600; // default to 10 minutes to avoid 100s HttpClient default timeout
 }
 
+public enum PublishMode
+{
+    Publish,
+    StartReview
+}
+
 public class ToolConfig
 {
     public string? TempRoot { get; set; }
     public int MaxDiffChars { get; set; } = 45000;
     public bool DryRun { get; set; } = false;
+    public PublishMode PublishMode { get; set; } = PublishMode.Publish;
 }
 
 public record InputArgs(string Workspace, string RepoSlug, int PrId)
@@ -490,7 +522,7 @@ public record InputArgs(string Workspace, string RepoSlug, int PrId)
             prUrl = args[0];
         }
 
-        for (int i = 0; i < args.Length; i++)
+        for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {

@@ -6,7 +6,7 @@ ASAPCodeReview is a tiny proof‑of‑concept that runs an AI‑assisted code re
 - Takes a Bitbucket PR URL (or workspace/repo/pr args)
 - Clones the source branch and computes a diff to the target
 - Sends the diff to a local model through Tabby
-- Posts the review back to the PR (or prints in dry‑run)
+- Posts the review back to the PR, or starts a draft review you can publish later (configurable), or prints in dry‑run
 
 ## Stack
 - .NET 9 console app
@@ -16,7 +16,7 @@ ASAPCodeReview is a tiny proof‑of‑concept that runs an AI‑assisted code re
 ## Quick start (Windows / PowerShell)
 1) Start Tabby (GPU example; CPU works with `--device cpu`):
 ```
-.\tabby.exe serve --model StarCoder-1B --chat-model Qwen2-1.5B-Instruct --device cuda --port 8080
+.\tabby.exe serve --model StarCoder2‑7B --chat-model Qwen2‑7B‑Instruct --device cuda --port 8080
 ```
 2) Create a user and copy the API key from: http://127.0.0.1:8080/
 
@@ -45,6 +45,9 @@ dotnet run --project .\ASAPCodeReview\ASAPCodeReview.csproj -- "https://bitbucke
 
 Tips:
 - For dry-run, set `Tool.DryRun` to `true` in appsettings.json (or export `TOOL_DRY_RUN=true`).
+- Choose how to handle the review output using `Tool.PublishMode` (or env `TOOL_PUBLISH_MODE`):
+  - `Publish` (default): immediately post a PR comment.
+  - `StartReview`: attempt to create a draft review comment you can publish later in Bitbucket.
 - Other optional settings (appsettings.json or env): `BITBUCKET_WORKSPACE`, `BITBUCKET_REPO_SLUG`, `TABBY_TIMEOUT_SECONDS`, `TOOL_TEMP_ROOT`, `TOOL_MAX_DIFF_CHARS`.
 
 ## Notes & limitations
